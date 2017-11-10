@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.drawable.Animatable;
 import android.net.Uri;
+import android.util.LruCache;
 import android.view.View;
 import android.widget.LinearLayout;
 
@@ -36,6 +37,26 @@ import com.google.android.gms.maps.model.MarkerOptions;
 import javax.annotation.Nullable;
 
 public class AirMapMarker extends AirMapFeature {
+  private static Bitmap DEFAULT_BITMAP = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+  private static BitmapDescriptor DEFAULT_BITMAP_DESCRIPTOR
+      = BitmapDescriptorFactory.fromBitmap(DEFAULT_BITMAP);
+
+  private static int cacheSize = 4 * 1024 * 1024;
+
+  private static final LruCache<String, BitmapDescriptorHolder> bitmapCache
+      = new LruCache<String, BitmapDescriptorHolder>(cacheSize) { };
+
+  private class BitmapDescriptorHolder {
+    private final String hash;
+    private final Bitmap bitmap;
+    private final BitmapDescriptor bitmapDescriptor;
+
+    private BitmapDescriptorHolder(Bitmap bitmap, BitmapDescriptor bitmapDescriptor, String hash) {
+      this.bitmap = bitmap;
+      this.bitmapDescriptor = bitmapDescriptor;
+      this.hash = hash;
+    }
+  }
 
   private MarkerOptions markerOptions;
   private Marker marker;
@@ -71,6 +92,7 @@ public class AirMapMarker extends AirMapFeature {
 
   private boolean hasCustomMarkerView = false;
 
+  private String uri;
   private final DraweeHolder<?> logoHolder;
   private DataSource<CloseableReference<CloseableImage>> dataSource;
   private final ControllerListener<ImageInfo> mLogoControllerListener =
@@ -82,17 +104,28 @@ public class AirMapMarker extends AirMapFeature {
             @Nullable Animatable animatable) {
           CloseableReference<CloseableImage> imageReference = null;
           try {
+
             imageReference = dataSource.getResult();
-            if (imageReference != null) {
-              CloseableImage image = imageReference.get();
-              if (image != null && image instanceof CloseableStaticBitmap) {
-                CloseableStaticBitmap closeableStaticBitmap = (CloseableStaticBitmap) image;
+            if (imageReference == null) return;
+
+            CloseableImage image = imageReference.get();
+            if (image == null || !(image instanceof CloseableStaticBitmap)) return;
+
+            CloseableStaticBitmap closeableStaticBitmap = (CloseableStaticBitmap) image;
+
+            synchronized (bitmapCache) {
+              if (bitmapCache.get(uri) == null) {
                 Bitmap bitmap = closeableStaticBitmap.getUnderlyingBitmap();
-                if (bitmap != null) {
-                  bitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
-                  iconBitmap = bitmap;
-                  iconBitmapDescriptor = BitmapDescriptorFactory.fromBitmap(bitmap);
-                }
+                if (bitmap == null) return;
+                bitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
+                iconBitmap = bitmap;
+                iconBitmapDescriptor = BitmapDescriptorFactory.fromBitmap(iconBitmap);
+                bitmapCache.put(uri, new BitmapDescriptorHolder(
+                    iconBitmap, iconBitmapDescriptor, uri));
+                return;
+              } else {
+                iconBitmap = bitmapCache.get(uri).bitmap;
+                iconBitmapDescriptor = bitmapCache.get(uri).bitmapDescriptor;
               }
             }
           } finally {
@@ -223,6 +256,18 @@ public class AirMapMarker extends AirMapFeature {
       update();
     } else if (uri.startsWith("http://") || uri.startsWith("https://") ||
         uri.startsWith("file://")) {
+
+      this.uri = uri;
+
+      synchronized (bitmapCache) {
+        if (bitmapCache.get(uri) != null) {
+          iconBitmap = bitmapCache.get(uri).bitmap;
+          iconBitmapDescriptor = bitmapCache.get(uri).bitmapDescriptor;
+          update();
+          return;
+        }
+      }
+
       ImageRequest imageRequest = ImageRequestBuilder
           .newBuilderWithSource(Uri.parse(uri))
           .build();
@@ -281,16 +326,45 @@ public class AirMapMarker extends AirMapFeature {
     if (hasCustomMarkerView) {
       // creating a bitmap from an arbitrary view
       if (iconBitmapDescriptor != null) {
-        Bitmap viewBitmap = createDrawable();
-        int width = Math.max(iconBitmap.getWidth(), viewBitmap.getWidth());
-        int height = Math.max(iconBitmap.getHeight(), viewBitmap.getHeight());
-        Bitmap combinedBitmap = Bitmap.createBitmap(width, height, iconBitmap.getConfig());
-        Canvas canvas = new Canvas(combinedBitmap);
-        canvas.drawBitmap(iconBitmap, 0, 0, null);
-        canvas.drawBitmap(viewBitmap, 0, 0, null);
-        return BitmapDescriptorFactory.fromBitmap(combinedBitmap);
+        BitmapDescriptorHolder viewBitmapDescriptorHolder = createDrawable();
+
+        if (iconBitmap != null && viewBitmapDescriptorHolder != null) {
+          Bitmap viewBitmap = viewBitmapDescriptorHolder.bitmap;
+
+          int width = Math.max(iconBitmap.getWidth(), viewBitmap.getWidth());
+          int height = Math.max(iconBitmap.getHeight(), viewBitmap.getHeight());
+          Bitmap combinedBitmap = Bitmap.createBitmap(width, height, iconBitmap.getConfig());
+
+          Canvas canvas = new Canvas(combinedBitmap);
+          canvas.drawBitmap(iconBitmap, 0, 0, null);
+          canvas.drawBitmap(viewBitmap, 0, 0, null);
+
+          String hash = uri + viewBitmapDescriptorHolder.hash;
+
+          synchronized (bitmapCache) {
+            if (bitmapCache.get(hash) == null) {
+              BitmapDescriptorHolder holder = new BitmapDescriptorHolder(combinedBitmap,
+                  BitmapDescriptorFactory.fromBitmap(combinedBitmap), hash);
+
+              bitmapCache.put(hash, holder);
+            }
+
+            return bitmapCache.get(hash).bitmapDescriptor;
+          }
+        } else if (viewBitmapDescriptorHolder != null) {
+          return viewBitmapDescriptorHolder.bitmapDescriptor;
+        } else if (iconBitmap != null) {
+          return iconBitmapDescriptor;
+        } else {
+          return DEFAULT_BITMAP_DESCRIPTOR;
+        }
       } else {
-        return BitmapDescriptorFactory.fromBitmap(createDrawable());
+        BitmapDescriptorHolder viewHolder = createDrawable();
+        if (viewHolder != null) {
+          return viewHolder.bitmapDescriptor;
+        }
+
+        return DEFAULT_BITMAP_DESCRIPTOR;
       }
     } else if (iconBitmapDescriptor != null) {
       // use local image as a marker
@@ -342,16 +416,32 @@ public class AirMapMarker extends AirMapFeature {
     update();
   }
 
-  private Bitmap createDrawable() {
-    int width = this.width <= 0 ? 100 : this.width;
-    int height = this.height <= 0 ? 100 : this.height;
+  private BitmapDescriptorHolder createDrawable() {
+    if (this.width <= 0 || this.height <= 0) {
+      return null;
+    }
+
+    int width = this.width;
+    int height = this.height;
+
     this.buildDrawingCache();
     Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
 
     Canvas canvas = new Canvas(bitmap);
     this.draw(canvas);
 
-    return bitmap;
+    String hash = Long.toString(hashBitmap(bitmap));
+
+    synchronized (bitmapCache) {
+      if (bitmapCache.get(hash) == null) {
+        BitmapDescriptorHolder holder = new BitmapDescriptorHolder(bitmap,
+            BitmapDescriptorFactory.fromBitmap(bitmap), hash);
+
+        bitmapCache.put(hash, holder);
+      }
+
+      return bitmapCache.get(hash);
+    }
   }
 
   public void setCalloutView(AirMapCallout view) {
@@ -431,4 +521,15 @@ public class AirMapMarker extends AirMapFeature {
     return BitmapDescriptorFactory.fromResource(getDrawableResourceByName(name));
   }
 
+  private static long PRIME = 31;
+  private static long hashBitmap(Bitmap bmp){
+    long hash = PRIME;
+    for(int x = 0; x < bmp.getWidth(); x++){
+      for (int y = 0; y < bmp.getHeight(); y++){
+        hash += (bmp.getPixel(x, y) + PRIME);
+      }
+    }
+
+    return hash;
+  }
 }
